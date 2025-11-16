@@ -8,6 +8,7 @@ A collection of Python experiments, algorithms, and explorations. Each experimen
 python-playground/
 ├── experiments/
 │   ├── algorithms/          # Algorithm implementations
+│   ├── ai-agents/           # AI-powered agents and tools
 │   ├── data-structures/     # Data structure implementations
 │   ├── web-scraping/        # Web scraping experiments
 │   ├── machine-learning/    # ML/AI experiments
@@ -19,6 +20,10 @@ python-playground/
 ### Algorithms
 
 - **[infix-to-postfix](experiments/algorithms/infix-to-postfix/)** - Converts infix mathematical expressions to postfix notation using the Shunting Yard algorithm. Includes comprehensive test suite and handles operator precedence, associativity, and unary operators.
+
+### AI Agents
+
+- **[r2d2-agent](experiments/ai-agents/r2d2-agent/)** - AI-powered network diagnostic agent using OpenAI. Executes ping, curl, dig, and traceroute commands with comprehensive input validation, error handling, and security features. Inspired by [fly.io blog post](https://fly.io/blog/everyone-write-an-agent/).
 
 ## Getting Started
 
