@@ -1,5 +1,6 @@
 # Core dependencies
 openai>=1.0.0
+cmd2>=2.4.0
 
 # Development dependencies (optional)
 # pytest>=7.0.0           # For running tests

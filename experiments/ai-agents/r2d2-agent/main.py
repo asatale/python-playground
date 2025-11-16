@@ -22,7 +22,9 @@ import subprocess
 import re
 import logging
 import argparse
+import cmd2
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def parse_arguments():
@@ -57,13 +59,16 @@ class Config:
     TRACEROUTE_TIMEOUT: int = 90
     DIG_TIMEOUT: int = 45
 
+    # Threading
+    MAX_CONCURRENT_TOOLS: int = 4  # Maximum concurrent tool executions
+
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
     # OpenAI settings
     MODEL: str = "gpt-5"
-    SYSTEM_PROMPT: str = "you're R2D2. Your job is to help a software engineer. Provide correct answers and be funny (in a nerdy way)"
+    SYSTEM_PROMPT: str = "you're R2D2. Your job is to help a network engineer. Provide correct answers and be funny (in a nerdy way). You have access to network tools that you can invoke from user's computer"
 
 
 # Parse command-line arguments
@@ -202,7 +207,7 @@ def validate_url_input(url: str) -> str:
 
     url = url.strip()
 
-    if not is_valid_url(url):
+    if not is_valid_url(url) or is_valid_hostname(url):
         raise ValidationError(f"Invalid URL format: {url}")
 
     return url
@@ -495,6 +500,8 @@ def handle_tools(tools: List[Dict[str, Any]], response: Any) -> bool:
     """
     Handle tool calls from OpenAI response.
 
+    Executes multiple tool calls concurrently using threads for better performance.
+
     Args:
         tools: List of available tools
         response: OpenAI API response
@@ -505,10 +512,48 @@ def handle_tools(tools: List[Dict[str, Any]], response: Any) -> bool:
     logger.debug(f"Handling tools. Response: {response.output}")
     if response.output[0].type == "reasoning":
         context.append(response.output[0])
+
     osz = len(context)
-    for item in response.output:
-        if item.type == "function_call":
-            context.extend(tool_call(item))
+
+    # Collect all function call items
+    function_calls = [item for item in response.output if item.type == "function_call"]
+
+    if not function_calls:
+        return len(context) != osz
+
+    # Execute all tool calls concurrently
+    if len(function_calls) == 1:
+        # Single call - no need for threading overhead
+        context.extend(tool_call(function_calls[0]))
+    else:
+        # Multiple calls - execute concurrently
+        logger.info(f"Executing {len(function_calls)} tool calls concurrently")
+        max_workers = min(len(function_calls), Config.MAX_CONCURRENT_TOOLS)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tool calls
+            future_to_item = {executor.submit(tool_call, item): item for item in function_calls}
+
+            # Collect results as they complete
+            results = []
+            for future in as_completed(future_to_item):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    item = future_to_item[future]
+                    logger.exception(f"Tool call failed for {item.name}: {e}")
+                    # Add error result to context
+                    results.append([item, {
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": f"Error: {str(e)}"
+                    }])
+
+            # Extend context with all results
+            for result in results:
+                context.extend(result)
+
     return len(context) != osz
 
 def process(line: str) -> str:
@@ -532,13 +577,71 @@ def process(line: str) -> str:
     return response.output_text
 
 
+class R2D2Shell(cmd2.Cmd):
+    """Interactive shell for R2D2 agent."""
+
+    intro = "R2D2 Network Diagnostic Agent - Type 'help' or '?' for commands, 'quit' to exit"
+    prompt = "R2D2> "
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the shell."""
+        super().__init__(*args, **kwargs)
+        # Remove default cmd2 commands that aren't useful for our use case
+        self.hidden_commands.extend(['alias', 'edit', 'macro', 'run_pyscript', 'run_script', 'shortcuts'])
+
+    def default(self, statement: cmd2.Statement) -> None:
+        """
+        Handle all user input as AI queries.
+
+        Args:
+            statement: The parsed user input
+        """
+        line = statement.raw
+        if not line.strip():
+            return
+
+        try:
+            result = process(line)
+            self.poutput(f"R2D2>; {result}\n")
+        except Exception as e:
+            logger.exception(f"Error processing query: {e}")
+            self.perror(f"Error: {e}")
+
+    def do_clear(self, _) -> None:
+        """Clear the conversation context (start fresh)."""
+        global context
+        context = [{"role": "system", "content": Config.SYSTEM_PROMPT}]
+        self.poutput("✓ Context cleared! Starting fresh conversation.")
+
+    def do_stats(self, _) -> None:
+        """Show statistics about the current conversation context."""
+        self.poutput(f"Context Statistics:")
+        self.poutput(f"  Messages in context: {len(context)}")
+        self.poutput(f"  Max messages allowed: {Config.MAX_CONTEXT_MESSAGES}")
+        self.poutput(f"  Context utilization: {len(context)-1}/{Config.MAX_CONTEXT_MESSAGES} ({(len(context)-1)/Config.MAX_CONTEXT_MESSAGES*100:.1f}%)")
+
+    def do_config(self, _) -> None:
+        """Show current configuration settings."""
+        self.poutput("Configuration:")
+        self.poutput(f"  Model: {Config.MODEL}")
+        self.poutput(f"  Max context messages: {Config.MAX_CONTEXT_MESSAGES}")
+        self.poutput(f"  Max concurrent tools: {Config.MAX_CONCURRENT_TOOLS}")
+        self.poutput(f"\nTool Timeouts:")
+        self.poutput(f"  Ping: {Config.PING_TIMEOUT}s")
+        self.poutput(f"  Curl: {Config.CURL_TIMEOUT}s")
+        self.poutput(f"  Traceroute: {Config.TRACEROUTE_TIMEOUT}s")
+        self.poutput(f"  Dig: {Config.DIG_TIMEOUT}s")
+
+
 def main() -> None:
-    """Main REPL loop for R2D2 agent."""
-    while True:
-        line = input("R2D2> ")
-        result = process(line)
-        print(f"R2D2>; {result}\n")
-        #print(f"Context: {context}")
+    """Main entry point for R2D2 agent."""
+    shell = R2D2Shell()
+    try:
+        shell.cmdloop()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, exiting...")
+        print("\nGoodbye!")
+
 
 if __name__ == '__main__':
     main()
