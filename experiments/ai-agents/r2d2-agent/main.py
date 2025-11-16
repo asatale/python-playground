@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+
 def parse_arguments():
     """
     Parse command-line arguments.
@@ -786,7 +787,13 @@ def manage_context_window() -> None:
         context = [context[0]] + context[-(Config.MAX_CONTEXT_MESSAGES):]
 
 
-client = OpenAI()
+try:
+    client = OpenAI()
+except Exception as e:
+    logger.error(f"Error initializing OpenAI API: {e}")
+    sys.exit(-1)
+
+
 context = [{
     "role": "system", "content": Config.SYSTEM_PROMPT
 }]
