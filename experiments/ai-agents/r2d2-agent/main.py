@@ -23,6 +23,11 @@ import re
 import logging
 import argparse
 import cmd2
+import threading
+import itertools
+import time
+import sys
+import os
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -40,10 +45,25 @@ def parse_arguments():
     )
     parser.add_argument(
         '-v', '--verbose',
-        action='store_true',
-        help='Enable verbose (debug) logging'
+        action='count',
+        default=0,
+        help='Increase verbosity: -v for INFO, -vv for DEBUG'
     )
     return parser.parse_args()
+
+
+def is_running_as_root() -> bool:
+    """
+    Check if program is running with root/sudo privileges.
+
+    Returns:
+        True if running as root, False otherwise
+    """
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        # Windows doesn't have geteuid, assume not root
+        return False
 
 
 # Configuration class
@@ -51,19 +71,23 @@ class Config:
     """Configuration settings for R2D2 agent."""
 
     # Context management
-    MAX_CONTEXT_MESSAGES: int = 50  # Maximum number of messages to keep in context (excluding system message)
+    MAX_CONTEXT_MESSAGES: int = 500  # Maximum number of messages to keep in context (excluding system message)
 
     # Tool timeouts (in seconds)
     PING_TIMEOUT: int = 30
     CURL_TIMEOUT: int = 60
     TRACEROUTE_TIMEOUT: int = 90
     DIG_TIMEOUT: int = 45
+    WHOIS_TIMEOUT: int = 30
+    NETSTAT_TIMEOUT: int = 10
+    NC_TIMEOUT: int = 10
+    MTR_TIMEOUT: int = 60
 
     # Threading
-    MAX_CONCURRENT_TOOLS: int = 4  # Maximum concurrent tool executions
+    MAX_CONCURRENT_TOOLS: int = 8  # Maximum concurrent tool executions
 
     # Logging
-    LOG_LEVEL: str = "INFO"
+    LOG_LEVEL: str = "WARNING"
     LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
     # OpenAI settings
@@ -75,7 +99,14 @@ class Config:
 args = parse_arguments()
 
 # Configure logging based on arguments
-log_level = logging.DEBUG if args.verbose else logging.INFO
+# 0 (no -v): WARNING, 1 (-v): INFO, 2+ (-vv): DEBUG
+if args.verbose == 0:
+    log_level = logging.WARNING
+elif args.verbose == 1:
+    log_level = logging.INFO
+else:  # 2 or more
+    log_level = logging.DEBUG
+
 logging.basicConfig(
     level=log_level,
     format=Config.LOG_FORMAT
@@ -213,6 +244,35 @@ def validate_url_input(url: str) -> str:
     return url
 
 
+def validate_port_input(port: str) -> int:
+    """
+    Validate and sanitize port number input.
+
+    Args:
+        port: The port number to validate (as string)
+
+    Returns:
+        The validated port as integer
+
+    Raises:
+        ValidationError: If port is invalid
+    """
+    if not port or not isinstance(port, str):
+        raise ValidationError("Port must be a non-empty string")
+
+    port = port.strip()
+
+    try:
+        port_int = int(port)
+    except ValueError:
+        raise ValidationError(f"Port must be a number: {port}")
+
+    if port_int < 1 or port_int > 65535:
+        raise ValidationError(f"Port must be between 1 and 65535: {port_int}")
+
+    return port_int
+
+
 tools = [
     {
         "type": "function", "name": "ping",
@@ -262,7 +322,63 @@ tools = [
             "required": ["host"],
         },
     },
+    {
+        "type": "function", "name": "whois",
+        "description": "Look up domain registration information including owner, registrar, and expiry dates",
+        "parameters": {
+            "type": "object", "properties": {
+                "domain": {
+                    "type": "string", "description": "domain name to look up",
+                },
+            },
+            "required": ["domain"],
+        },
+    },
+    {
+        "type": "function", "name": "netstat",
+        "description": "Show network connections, listening ports, and routing table",
+        "parameters": {
+            "type": "object", "properties": {
+                "args": {
+                    "type": "string",
+                    "description": "arguments for netstat (default: -tuln for TCP/UDP listening ports)",
+                    "default": "-tuln"
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "type": "function", "name": "nc",
+        "description": "Test if a TCP port is open and accepting connections on a host",
+        "parameters": {
+            "type": "object", "properties": {
+                "host": {
+                    "type": "string", "description": "hostname or IP address",
+                },
+                "port": {
+                    "type": "string", "description": "port number (1-65535)",
+                },
+            },
+            "required": ["host", "port"],
+        },
+    },
 ]
+
+# Add privileged tools if running as root
+if is_running_as_root():
+    tools.append({
+        "type": "function", "name": "mtr",
+        "description": "My Traceroute - combines ping and traceroute showing packet loss and latency at each hop",
+        "parameters": {
+            "type": "object", "properties": {
+                "host": {
+                    "type": "string", "description": "hostname or IP address",
+                },
+            },
+            "required": ["host"],
+        },
+    })
 
 
 def ping(host: str = "") -> str:
@@ -441,13 +557,219 @@ def dig(host: str = "") -> str:
         logger.exception(f"Unexpected error while executing dig to {host}: {e}")
         return f"Unexpected error: {e}"
 
-    
+def whois(domain: str = "") -> str:
+    """
+    Execute whois command to look up domain registration information.
+
+    Args:
+        domain: Domain name to look up
+
+    Returns:
+        stdout from whois command or error message
+
+    Raises:
+        ToolTimeoutError: If whois times out after 30 seconds
+    """
+    logger.info(f"Attempting whois lookup for {domain}")
+    try:
+        # Validate input
+        domain = validate_host_input(domain)
+
+        result = subprocess.run(
+            ["whois", domain],
+            text=True,
+            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            timeout=Config.WHOIS_TIMEOUT)
+
+        if result.returncode != 0:
+            raise ToolExecutionError(f"whois command failed with return code {result.returncode}")
+
+        logger.debug(f"Whois successful for {domain}")
+        return result.stdout
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        return f"Validation error: {e}"
+    except subprocess.TimeoutExpired:
+        error_msg = f"whois for {domain} timed out after {Config.WHOIS_TIMEOUT} seconds"
+        logger.error(f"Timeout error: {error_msg}")
+        raise ToolTimeoutError(error_msg)
+    except ToolExecutionError as e:
+        logger.error(f"Execution error: {e}")
+        return f"Execution error: {e}"
+    except Exception as e:
+        logger.exception(f"Unexpected error while executing whois for {domain}: {e}")
+        return f"Unexpected error: {e}"
+
+def netstat(args: str = "-tuln") -> str:
+    """
+    Execute netstat command to show network connections and listening ports.
+
+    Args:
+        args: Arguments for netstat (default: -tuln for TCP/UDP listening ports)
+
+    Returns:
+        stdout from netstat command or error message
+
+    Raises:
+        ToolTimeoutError: If netstat times out after 10 seconds
+    """
+    logger.info(f"Attempting netstat with args: {args}")
+    try:
+        # Whitelist safe arguments
+        safe_args = ["-tuln", "-tulnp", "-an", "-r", "-i", "-s"]
+        if args not in safe_args:
+            raise ValidationError(f"Unsafe netstat arguments. Allowed: {', '.join(safe_args)}")
+
+        # Try netstat first, fallback to ss if not available
+        try:
+            result = subprocess.run(
+                ["netstat"] + args.split(),
+                text=True,
+                stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE,
+                timeout=Config.NETSTAT_TIMEOUT)
+        except FileNotFoundError:
+            # Fallback to ss (socket statistics, modern replacement)
+            logger.debug("netstat not found, trying ss")
+            result = subprocess.run(
+                ["ss"] + args.split(),
+                text=True,
+                stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE,
+                timeout=Config.NETSTAT_TIMEOUT)
+
+        if result.returncode != 0:
+            raise ToolExecutionError(f"netstat/ss command failed with return code {result.returncode}")
+
+        logger.debug(f"Netstat successful with args: {args}")
+        return result.stdout
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        return f"Validation error: {e}"
+    except subprocess.TimeoutExpired:
+        error_msg = f"netstat timed out after {Config.NETSTAT_TIMEOUT} seconds"
+        logger.error(f"Timeout error: {error_msg}")
+        raise ToolTimeoutError(error_msg)
+    except ToolExecutionError as e:
+        logger.error(f"Execution error: {e}")
+        return f"Execution error: {e}"
+    except Exception as e:
+        logger.exception(f"Unexpected error while executing netstat: {e}")
+        return f"Unexpected error: {e}"
+
+def nc(host: str = "", port: str = "80") -> str:
+    """
+    Execute nc (netcat) command to test if a port is open.
+
+    Args:
+        host: Hostname or IP address
+        port: Port number (1-65535)
+
+    Returns:
+        Result message indicating if port is open or closed
+
+    Raises:
+        ToolTimeoutError: If nc times out after 10 seconds
+    """
+    logger.info(f"Attempting nc to {host}:{port}")
+    try:
+        # Validate input
+        host = validate_host_input(host)
+        port_int = validate_port_input(port)
+
+        result = subprocess.run(
+            ["nc", "-zv", host, str(port_int)],
+            text=True,
+            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            timeout=Config.NC_TIMEOUT)
+
+        # nc returns 0 if connection succeeds, 1 if it fails
+        if result.returncode == 0:
+            logger.debug(f"Port {port_int} is open on {host}")
+            return f"Port {port_int} is OPEN on {host}\n{result.stdout}"
+        else:
+            logger.debug(f"Port {port_int} is closed on {host}")
+            return f"Port {port_int} is CLOSED on {host}\n{result.stdout}"
+
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        return f"Validation error: {e}"
+    except subprocess.TimeoutExpired:
+        error_msg = f"nc to {host}:{port} timed out after {Config.NC_TIMEOUT} seconds"
+        logger.error(f"Timeout error: {error_msg}")
+        raise ToolTimeoutError(error_msg)
+    except FileNotFoundError:
+        error_msg = "nc (netcat) command not found on system"
+        logger.error(error_msg)
+        return f"Error: {error_msg}"
+    except Exception as e:
+        logger.exception(f"Unexpected error while executing nc to {host}:{port}: {e}")
+        return f"Unexpected error: {e}"
+
+def mtr(host: str = "") -> str:
+    """
+    Execute mtr (My Traceroute) command - combines ping and traceroute.
+
+    Args:
+        host: Hostname or IP address to trace
+
+    Returns:
+        stdout from mtr command or error message
+
+    Raises:
+        ToolTimeoutError: If mtr times out after 60 seconds
+    """
+    logger.info(f"Attempting mtr to {host}")
+    try:
+        # Validate input
+        host = validate_host_input(host)
+
+        result = subprocess.run(
+            ["mtr", "-r", "-c", "10", host],
+            text=True,
+            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            timeout=Config.MTR_TIMEOUT)
+
+        if result.returncode != 0:
+            raise ToolExecutionError(f"mtr command failed with return code {result.returncode}")
+
+        logger.debug(f"MTR successful for {host}")
+        return result.stdout
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        return f"Validation error: {e}"
+    except subprocess.TimeoutExpired:
+        error_msg = f"mtr to {host} timed out after {Config.MTR_TIMEOUT} seconds"
+        logger.error(f"Timeout error: {error_msg}")
+        raise ToolTimeoutError(error_msg)
+    except ToolExecutionError as e:
+        logger.error(f"Execution error: {e}")
+        return f"Execution error: {e}"
+    except FileNotFoundError:
+        error_msg = "mtr command not found on system"
+        logger.error(error_msg)
+        return f"Error: {error_msg}"
+    except Exception as e:
+        logger.exception(f"Unexpected error while executing mtr to {host}: {e}")
+        return f"Unexpected error: {e}"
+
+
 tool_registry = {
     "ping": ping,
     "traceroute": traceroute,
     "dig": dig,
     "curl": curl,
+    "whois": whois,
+    "netstat": netstat,
+    "nc": nc,
 }
+
+# Add privileged tools to registry if running as root
+if is_running_as_root():
+    tool_registry["mtr"] = mtr
 
 
 def manage_context_window() -> None:
@@ -593,6 +915,8 @@ class R2D2Shell(cmd2.Cmd):
         """
         Handle all user input as AI queries.
 
+        Runs processing in background thread with progress indicator.
+
         Args:
             statement: The parsed user input
         """
@@ -600,12 +924,40 @@ class R2D2Shell(cmd2.Cmd):
         if not line.strip():
             return
 
+        # Containers for thread results
+        result_container = []
+        error_container = []
+
+        def process_query():
+            """Process the query in background thread."""
+            try:
+                result = process(line)
+                result_container.append(result)
+            except Exception as e:
+                error_container.append(e)
+
+        # Start processing thread
+        thread = threading.Thread(target=process_query, daemon=True)
+        thread.start()
+
+        # Show spinner while waiting
+        spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
         try:
-            result = process(line)
-            self.poutput(f"R2D2>; {result}\n")
-        except Exception as e:
-            logger.exception(f"Error processing query: {e}")
-            self.perror(f"Error: {e}")
+            while thread.is_alive():
+                sys.stdout.write(f"\r{next(spinner)} R2D2 is thinking...")
+                sys.stdout.flush()
+                time.sleep(0.1)
+        finally:
+            # Clear spinner line
+            sys.stdout.write("\r" + " " * 40 + "\r")
+            sys.stdout.flush()
+
+        # Display result or error
+        if result_container:
+            self.poutput(f"R2D2>; {result_container[0]}\n")
+        elif error_container:
+            logger.exception(f"Error processing query: {error_container[0]}")
+            self.perror(f"Error: {error_container[0]}")
 
     def do_clear(self, _) -> None:
         """Clear the conversation context (start fresh)."""
@@ -626,11 +978,19 @@ class R2D2Shell(cmd2.Cmd):
         self.poutput(f"  Model: {Config.MODEL}")
         self.poutput(f"  Max context messages: {Config.MAX_CONTEXT_MESSAGES}")
         self.poutput(f"  Max concurrent tools: {Config.MAX_CONCURRENT_TOOLS}")
+        self.poutput(f"  Running as root: {is_running_as_root()}")
         self.poutput(f"\nTool Timeouts:")
         self.poutput(f"  Ping: {Config.PING_TIMEOUT}s")
         self.poutput(f"  Curl: {Config.CURL_TIMEOUT}s")
         self.poutput(f"  Traceroute: {Config.TRACEROUTE_TIMEOUT}s")
         self.poutput(f"  Dig: {Config.DIG_TIMEOUT}s")
+        self.poutput(f"  Whois: {Config.WHOIS_TIMEOUT}s")
+        self.poutput(f"  Netstat: {Config.NETSTAT_TIMEOUT}s")
+        self.poutput(f"  NC (netcat): {Config.NC_TIMEOUT}s")
+        if is_running_as_root():
+            self.poutput(f"  MTR: {Config.MTR_TIMEOUT}s (privileged)")
+        else:
+            self.poutput(f"  MTR: Not available (requires sudo)")
 
 
 def main() -> None:
