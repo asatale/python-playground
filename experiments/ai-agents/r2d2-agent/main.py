@@ -28,6 +28,7 @@ import itertools
 import time
 import sys
 import os
+import shutil
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -65,6 +66,48 @@ def is_running_as_root() -> bool:
     except AttributeError:
         # Windows doesn't have geteuid, assume not root
         return False
+
+
+def is_command_available(command: str) -> bool:
+    """
+    Check if a command is available on the system.
+
+    Args:
+        command: Command name to check (e.g., 'ping', 'curl')
+
+    Returns:
+        True if command is available, False otherwise
+    """
+    return shutil.which(command) is not None
+
+
+def get_available_tools() -> Dict[str, Any]:
+    """
+    Check which network diagnostic tools are available on the system.
+
+    Returns:
+        Dictionary mapping tool names to their availability status
+    """
+    tool_commands = {
+        "ping": "ping",
+        "curl": "curl",
+        "dig": "dig",
+        "traceroute": "traceroute",
+        "whois": "whois",
+        "netstat": "netstat",  # Falls back to 'ss' if not available
+        "nc": "nc",
+        "mtr": "mtr"
+    }
+
+    available = {}
+    for tool_name, command in tool_commands.items():
+        # Special case for netstat - check both netstat and ss
+        if tool_name == "netstat":
+            available[tool_name] = is_command_available("netstat") or is_command_available("ss")
+        else:
+            available[tool_name] = is_command_available(command)
+
+    return available
 
 
 # Configuration class
@@ -274,7 +317,8 @@ def validate_port_input(port: str) -> int:
     return port_int
 
 
-tools = [
+# Define all possible tools (before filtering for availability)
+all_possible_tools = [
     {
         "type": "function", "name": "ping",
         "description": "ping some host on the internet",
@@ -287,7 +331,7 @@ tools = [
             "required": ["host"],
         },
     },
-        {
+    {
         "type": "function", "name": "curl",
         "description": "curl - transfer a URL",
         "parameters": {
@@ -364,13 +408,9 @@ tools = [
             "required": ["host", "port"],
         },
     },
-]
-
-# Add privileged tools if running as root
-if is_running_as_root():
-    tools.append({
+    {
         "type": "function", "name": "mtr",
-        "description": "My Traceroute - combines ping and traceroute showing packet loss and latency at each hop",
+        "description": "My Traceroute - combines ping and traceroute showing packet loss and latency at each hop (requires root privileges)",
         "parameters": {
             "type": "object", "properties": {
                 "host": {
@@ -379,7 +419,28 @@ if is_running_as_root():
             },
             "required": ["host"],
         },
-    })
+    },
+]
+
+# Check which tools are available on the system
+available_tools_status = get_available_tools()
+
+# Filter tools based on availability and privilege level
+tools = []
+for tool_def in all_possible_tools:
+    tool_name = tool_def["name"]
+
+    # Skip mtr if not running as root, even if it's installed
+    if tool_name == "mtr" and not is_running_as_root():
+        logger.info(f"Tool '{tool_name}' requires root privileges - not advertising to API")
+        continue
+
+    # Only include tool if it's available on the system
+    if available_tools_status.get(tool_name, False):
+        tools.append(tool_def)
+        logger.info(f"Tool '{tool_name}' is available and will be advertised to API")
+    else:
+        logger.warning(f"Tool '{tool_name}' is NOT available on this system - not advertising to API")
 
 
 def ping(host: str = "") -> str:
@@ -758,7 +819,8 @@ def mtr(host: str = "") -> str:
         return f"Unexpected error: {e}"
 
 
-tool_registry = {
+# Define all possible tool functions
+all_tool_functions = {
     "ping": ping,
     "traceroute": traceroute,
     "dig": dig,
@@ -766,11 +828,19 @@ tool_registry = {
     "whois": whois,
     "netstat": netstat,
     "nc": nc,
+    "mtr": mtr,
 }
 
-# Add privileged tools to registry if running as root
-if is_running_as_root():
-    tool_registry["mtr"] = mtr
+# Filter tool_registry based on availability and privilege level
+tool_registry = {}
+for tool_name, tool_func in all_tool_functions.items():
+    # Skip mtr if not running as root
+    if tool_name == "mtr" and not is_running_as_root():
+        continue
+
+    # Only include tool if it's available on the system
+    if available_tools_status.get(tool_name, False):
+        tool_registry[tool_name] = tool_func
 
 
 def manage_context_window() -> None:
