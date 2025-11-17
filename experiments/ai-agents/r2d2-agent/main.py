@@ -986,7 +986,7 @@ class R2D2Shell(cmd2.Cmd):
         """Initialize the shell."""
         super().__init__(*args, **kwargs)
         # Remove default cmd2 commands that aren't useful for our use case
-        self.hidden_commands.extend(['alias', 'edit', 'macro', 'run_pyscript', 'run_script', 'shortcuts'])
+        self.hidden_commands.extend(['alias', 'edit', 'history', 'macro', 'run_pyscript', 'run_script', 'shortcuts', 'shell', 'set'])
 
     def default(self, statement: cmd2.Statement) -> None:
         """
