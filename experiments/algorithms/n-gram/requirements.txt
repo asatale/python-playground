@@ -1,0 +1,7 @@
+# N-gram Generator Requirements
+#
+# This project uses only Python standard library.
+# No external dependencies are required for core functionality.
+#
+# For development/testing (optional):
+# pytest>=7.0.0  # Alternative test runner
