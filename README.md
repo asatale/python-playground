@@ -20,6 +20,7 @@ python-playground/
 ### Algorithms
 
 - **[infix-to-postfix](experiments/algorithms/infix-to-postfix/)** - Converts infix mathematical expressions to postfix notation using the Shunting Yard algorithm. Includes comprehensive test suite and handles operator precedence, associativity, and unary operators.
+- **[n-gram](experiments/algorithms/n-gram/)** - Generates n-grams (contiguous sequences of n characters) from text using a sliding window approach. Useful for text analysis, NLP, and pattern recognition applications.
 
 ### AI Agents
 
