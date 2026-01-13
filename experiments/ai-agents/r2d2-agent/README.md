@@ -6,7 +6,7 @@ Inspired by: https://fly.io/blog/everyone-write-an-agent/
 
 ## Features
 
-- AI-powered conversational interface using OpenAI
+- AI-powered conversational interface using [aisuite](https://github.com/andrewyng/aisuite) (supports OpenAI, Anthropic, Google, AWS Bedrock, and more)
 - **7 network diagnostic commands**: `ping`, `curl`, `dig`, `traceroute`, `whois`, `netstat`, `nc`
 - **Privileged tool** (requires sudo): `mtr` - advanced traceroute with statistics
 - **Concurrent tool execution** using threads for better performance
@@ -23,7 +23,11 @@ Inspired by: https://fly.io/blog/everyone-write-an-agent/
 ## Requirements
 
 - Python 3.7+
-- OpenAI API key
+- API key for your chosen LLM provider (OpenAI, Anthropic, Google, AWS, etc.)
+  - For OpenAI: Set `OPENAI_API_KEY` environment variable
+  - For Anthropic: Set `ANTHROPIC_API_KEY` environment variable
+  - For Google: Set `GOOGLE_API_KEY` environment variable
+  - See [aisuite documentation](https://github.com/andrewyng/aisuite) for other providers
 - Network diagnostic tools installed: `ping`, `curl`, `dig`, `traceroute`, `whois`, `netstat` (or `ss`), `nc`
 - **Optional (for mtr)**: `mtr` tool and sudo/root privileges
 
@@ -45,9 +49,26 @@ Inspired by: https://fly.io/blog/everyone-write-an-agent/
    pip install -r requirements.txt
    ```
 
-4. Set your OpenAI API key:
+4. Set your API key for your chosen provider:
    ```bash
+   # For OpenAI (default)
    export OPENAI_API_KEY='your-api-key-here'
+
+   # Or for Anthropic
+   export ANTHROPIC_API_KEY='your-api-key-here'
+
+   # Or for Google
+   export GOOGLE_API_KEY='your-api-key-here'
+
+   # See aisuite docs for other providers
+   ```
+
+5. (Optional) Configure the model in `main.py`:
+   ```python
+   # In Config class, change MODEL to your preferred provider:model
+   MODEL = "openai:gpt-4o"           # OpenAI GPT-4o (default)
+   # MODEL = "anthropic:claude-3-5-sonnet-20241022"  # Anthropic Claude 3.5 Sonnet
+   # MODEL = "google:gemini-1.5-pro"  # Google Gemini 1.5 Pro
    ```
 
 ## Usage
@@ -100,7 +121,7 @@ R2D2>; *excited droid noises* Running a DNS lookup... [executes dig] ...
 
 ## Configuration
 
-All settings are centralized in the `Config` class (main.py:27-52):
+All settings are centralized in the `Config` class (main.py):
 
 ```python
 class Config:
@@ -124,29 +145,50 @@ class Config:
     LOG_LEVEL = "WARNING"  # Default level (use -v or -vv to increase)
     LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
-    # OpenAI settings
-    MODEL = "gpt-5"
+    # AI Provider settings
+    # Format: "provider:model"
+    # Examples:
+    #   - "openai:gpt-4o"
+    #   - "anthropic:claude-3-5-sonnet-20241022"
+    #   - "google:gemini-1.5-pro"
+    MODEL = "openai:gpt-4o"
     SYSTEM_PROMPT = "you're R2D2. Your job is to help..."
 ```
+
+### Switching Between AI Providers
+
+R2D2 uses [aisuite](https://github.com/andrewyng/aisuite) which provides a unified interface to multiple AI providers. To switch providers:
+
+1. Install the provider-specific package (if needed):
+   ```bash
+   pip install 'aisuite[anthropic]'  # For Anthropic
+   pip install 'aisuite[google]'     # For Google
+   pip install 'aisuite[all]'        # For all providers
+   ```
+
+2. Set the appropriate API key environment variable
+
+3. Update the `MODEL` setting in `Config` class to use the format `"provider:model"`
 
 
 ## Tool Execution Flow
 
 1. User sends request to R2D2
-2. OpenAI determines which tool(s) to call
+2. AI model determines which tool(s) to call
 3. Input validation (prevents command injection)
 4. Execute command with timeout
 5. Check return code for errors
-6. Return results to OpenAI
-7. OpenAI formulates response to user
+6. Return results to AI model
+7. AI model formulates response to user
 
 ## Limitations
 
-- Requires OpenAI API key (API calls incur costs)
+- Requires API key for chosen LLM provider (API calls incur costs)
 - Network tools must be installed on the system
 - `traceroute` may require root privileges (uses `-I` flag for ICMP)
 - `mtr` requires sudo/root privileges to run
 - Context limited to last 500 messages
+- Not all AI providers may support function calling (tool use) - OpenAI, Anthropic, and Google models are recommended
 
 ## License
 

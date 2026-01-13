@@ -1,5 +1,5 @@
 # Core dependencies
-openai>=1.0.0
+aisuite[openai,mcp]>=0.1.0
 cmd2>=2.4.0
 
 # Development dependencies (optional)

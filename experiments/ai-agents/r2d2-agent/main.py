@@ -7,7 +7,7 @@ dig, and traceroute to help software engineers debug network issues.
 Inspired by: https://fly.io/blog/everyone-write-an-agent/
 
 Requirements:
-    - OpenAI API key must be set in environment variable: OPENAI_API_KEY
+    - OpenAI API key must be set in environment variable: OPENAI_API_KEY (or other provider key)
     - Network diagnostic tools must be installed: ping, curl, dig, traceroute
 
 Usage:
@@ -15,7 +15,7 @@ Usage:
     python main.py
 """
 
-from openai import OpenAI
+import aisuite as ai
 from typing import Dict, List, Any, Optional
 import json
 import subprocess
@@ -134,8 +134,9 @@ class Config:
     LOG_LEVEL: str = "WARNING"
     LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
-    # OpenAI settings
-    MODEL: str = "gpt-5"
+    # AI Provider settings
+    # Format: "provider:model" (e.g., "openai:gpt-4", "anthropic:claude-3-5-sonnet-20241022", "google:gemini-1.5-pro")
+    MODEL: str = "openai:gpt-4o"
     SYSTEM_PROMPT: str = "you're R2D2. Your job is to help a network engineer. Provide correct answers and be funny (in a nerdy way). You have access to network tools that you can invoke from user's computer"
 
 
@@ -858,9 +859,9 @@ def manage_context_window() -> None:
 
 
 try:
-    client = OpenAI()
+    client = ai.Client()
 except Exception as e:
-    logger.error(f"Error initializing OpenAI API: {e}")
+    logger.error(f"Error initializing aisuite client: {e}")
     sys.exit(-1)
 
 
@@ -870,68 +871,98 @@ context = [{
 
 
 def call(tools: List[Dict[str, Any]]) -> Any:
-    """Call OpenAI API with tools and context."""
-    return client.responses.create(model=Config.MODEL, tools=tools, input=context)
+    """Call AI provider API with tools and context."""
+    return client.chat.completions.create(
+        model=Config.MODEL,
+        messages=context,
+        tools=tools
+    )
 
-def tool_call(item: Any) -> List[Any]:
+def tool_call(item: Any) -> Dict[str, Any]:
     """
     Execute a single tool call.
 
     Args:
-        item: Tool call item from OpenAI response
+        item: Tool call item from API response
 
     Returns:
-        List containing the original item and function call output
+        Tool message dictionary for the context
     """
-    logger.info(f"Invoking {item.name} with args: {item.arguments}")
-    if item.name not in tool_registry:
-        logger.error(f"Unknown tool requested: {item.name}")
-        return "Error"
+    function_name = item.function.name
+    function_args = item.function.arguments
+    tool_call_id = item.id
 
-    result = tool_registry[item.name](**json.loads(item.arguments))
-    return [ item, {
-        "type": "function_call_output",
-        "call_id": item.call_id,
-        "output": result
-    }]
+    logger.info(f"Invoking {function_name} with args: {function_args}")
+
+    if function_name not in tool_registry:
+        logger.error(f"Unknown tool requested: {function_name}")
+        result = f"Error: Unknown tool {function_name}"
+    else:
+        try:
+            result = tool_registry[function_name](**json.loads(function_args))
+        except Exception as e:
+            logger.exception(f"Error executing {function_name}: {e}")
+            result = f"Error: {str(e)}"
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": str(result)
+    }
 
 def handle_tools(tools: List[Dict[str, Any]], response: Any) -> bool:
     """
-    Handle tool calls from OpenAI response.
+    Handle tool calls from AI provider response.
 
     Executes multiple tool calls concurrently using threads for better performance.
 
     Args:
         tools: List of available tools
-        response: OpenAI API response
+        response: API response from aisuite
 
     Returns:
         True if any tools were called, False otherwise
     """
-    logger.debug(f"Handling tools. Response: {response.output}")
-    if response.output[0].type == "reasoning":
-        context.append(response.output[0])
+    message = response.choices[0].message
+    logger.debug(f"Handling tools. Response message: {message}")
 
     osz = len(context)
 
-    # Collect all function call items
-    function_calls = [item for item in response.output if item.type == "function_call"]
+    # Check if there are tool calls
+    tool_calls = getattr(message, 'tool_calls', None)
 
-    if not function_calls:
-        return len(context) != osz
+    if not tool_calls:
+        return False
+
+    # Add the assistant message with tool calls to context
+    context.append({
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
+            } for tc in tool_calls
+        ]
+    })
 
     # Execute all tool calls concurrently
-    if len(function_calls) == 1:
+    if len(tool_calls) == 1:
         # Single call - no need for threading overhead
-        context.extend(tool_call(function_calls[0]))
+        tool_result = tool_call(tool_calls[0])
+        context.append(tool_result)
     else:
         # Multiple calls - execute concurrently
-        logger.info(f"Executing {len(function_calls)} tool calls concurrently")
-        max_workers = min(len(function_calls), Config.MAX_CONCURRENT_TOOLS)
+        logger.info(f"Executing {len(tool_calls)} tool calls concurrently")
+        max_workers = min(len(tool_calls), Config.MAX_CONCURRENT_TOOLS)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tool calls
-            future_to_item = {executor.submit(tool_call, item): item for item in function_calls}
+            future_to_item = {executor.submit(tool_call, item): item for item in tool_calls}
 
             # Collect results as they complete
             results = []
@@ -941,17 +972,17 @@ def handle_tools(tools: List[Dict[str, Any]], response: Any) -> bool:
                     results.append(result)
                 except Exception as e:
                     item = future_to_item[future]
-                    logger.exception(f"Tool call failed for {item.name}: {e}")
+                    logger.exception(f"Tool call failed for {item.function.name}: {e}")
                     # Add error result to context
-                    results.append([item, {
-                        "type": "function_call_output",
-                        "call_id": item.call_id,
-                        "output": f"Error: {str(e)}"
-                    }])
+                    results.append({
+                        "role": "tool",
+                        "tool_call_id": item.id,
+                        "content": f"Error: {str(e)}"
+                    })
 
-            # Extend context with all results
+            # Add all results to context
             for result in results:
-                context.extend(result)
+                context.append(result)
 
     return len(context) != osz
 
@@ -968,12 +999,14 @@ def process(line: str) -> str:
     context.append({"role": "user", "content": line})
     manage_context_window()  # Manage context size
     response = call(tools)
-    # new code: resolve tool calls
+    # Resolve tool calls in a loop
     while handle_tools(tools, response):
         response = call(tools)
-    context.append({"role": "assistant", "content": response.output_text})
+    # Add final assistant response to context
+    final_message = response.choices[0].message
+    context.append({"role": "assistant", "content": final_message.content or ""})
     manage_context_window()  # Manage context size after response
-    return response.output_text
+    return final_message.content or ""
 
 
 class R2D2Shell(cmd2.Cmd):
